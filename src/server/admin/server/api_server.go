@@ -60,7 +60,10 @@ func (a *apiServer) Extract(request *admin.ExtractRequest, extractServer admin.A
 			}
 		}()
 		w := pbutil.NewWriter(snappyW)
-		handleOp = func(op *admin.Op) error { return w.Write(op) }
+		handleOp = func(op *admin.Op) error {
+			_, err := w.Write(op)
+			return err
+		}
 	}
 	if !request.NoObjects {
 		w := extractObjectWriter(handleOp)
@@ -238,6 +241,9 @@ func sortPipelineInfos(pis []*pps.PipelineInfo) []*pps.PipelineInfo {
 				if input.Atom != nil {
 					add(input.Atom.Repo)
 				}
+				if input.Pfs != nil {
+					add(input.Pfs.Repo)
+				}
 			})
 			result = append(result, pi)
 			delete(piMap, name)
@@ -261,7 +267,6 @@ func pipelineInfoToRequest(pi *pps.PipelineInfo) *pps.CreatePipelineRequest {
 		ResourceLimits:     pi.ResourceLimits,
 		Input:              pi.Input,
 		Description:        pi.Description,
-		Incremental:        pi.Incremental,
 		CacheSize:          pi.CacheSize,
 		EnableStats:        pi.EnableStats,
 		Batch:              pi.Batch,

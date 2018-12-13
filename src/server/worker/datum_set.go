@@ -72,6 +72,61 @@ func (d *atomDatumFactory) Datum(i int) []*Input {
 	return []*Input{d.inputs[i]}
 }
 
+type pfsDatumFactory struct {
+	inputs []*Input
+}
+
+func newPFSDatumFactory(pachClient *client.APIClient, input *pps.PFSInput) (DatumFactory, error) {
+	result := &pfsDatumFactory{}
+	if input.Commit == "" {
+		// this can happen if a pipeline with multiple inputs has been triggered
+		// before all commits have inputs
+		return result, nil
+	}
+	fs, err := pachClient.GlobFileStream(pachClient.Ctx(), &pfs.GlobFileRequest{
+		Commit:  client.NewCommit(input.Repo, input.Commit),
+		Pattern: input.Glob,
+	})
+	if err != nil {
+		return nil, err
+	}
+	for {
+		fileInfo, err := fs.Recv()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+		result.inputs = append(result.inputs, &Input{
+			FileInfo:   fileInfo,
+			Name:       input.Name,
+			Lazy:       input.Lazy,
+			Branch:     input.Branch,
+			EmptyFiles: input.EmptyFiles,
+		})
+	}
+	// We sort the inputs so that the order is deterministic. Note that it's
+	// not possible for 2 inputs to have the same path so this is guaranteed to
+	// produce a deterministic order.
+	sort.Slice(result.inputs, func(i, j int) bool {
+		// We sort by descending size first because it can boost performance to
+		// process the biggest datums first.
+		if result.inputs[i].FileInfo.SizeBytes != result.inputs[j].FileInfo.SizeBytes {
+			return result.inputs[i].FileInfo.SizeBytes > result.inputs[j].FileInfo.SizeBytes
+		}
+		return result.inputs[i].FileInfo.File.Path < result.inputs[j].FileInfo.File.Path
+	})
+	return result, nil
+}
+
+func (d *pfsDatumFactory) Len() int {
+	return len(d.inputs)
+}
+
+func (d *pfsDatumFactory) Datum(i int) []*Input {
+	return []*Input{d.inputs[i]}
+}
+
 type unionDatumFactory struct {
 	inputs []DatumFactory
 }
@@ -130,6 +185,7 @@ func (d *crossDatumFactory) Datum(i int) []*Input {
 		result = append(result, datumFactory.Datum(i%datumFactory.Len())...)
 		i /= datumFactory.Len()
 	}
+	sortInputs(result)
 	return result
 }
 
@@ -181,7 +237,7 @@ func newCrossDatumFactory(pachClient *client.APIClient, cross []*pps.Input) (Dat
 }
 
 func newCronDatumFactory(pachClient *client.APIClient, input *pps.CronInput) (DatumFactory, error) {
-	return newAtomDatumFactory(pachClient, &pps.AtomInput{
+	return newPFSDatumFactory(pachClient, &pps.PFSInput{
 		Name:   input.Name,
 		Repo:   input.Repo,
 		Branch: "master",
@@ -195,6 +251,8 @@ func NewDatumFactory(pachClient *client.APIClient, input *pps.Input) (DatumFacto
 	switch {
 	case input.Atom != nil:
 		return newAtomDatumFactory(pachClient, input.Atom)
+	case input.Pfs != nil:
+		return newPFSDatumFactory(pachClient, input.Pfs)
 	case input.Union != nil:
 		return newUnionDatumFactory(pachClient, input.Union)
 	case input.Cross != nil:
@@ -205,4 +263,10 @@ func NewDatumFactory(pachClient *client.APIClient, input *pps.Input) (DatumFacto
 		return newGitDatumFactory(pachClient, input.Git)
 	}
 	return nil, fmt.Errorf("unrecognized input type")
+}
+
+func sortInputs(inputs []*Input) {
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].Name < inputs[j].Name
+	})
 }

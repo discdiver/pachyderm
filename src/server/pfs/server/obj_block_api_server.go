@@ -37,6 +37,8 @@ const (
 	objectCacheShares     = 8
 	tagCacheShares        = 1
 	objectInfoCacheShares = 1
+	blockCacheShares      = 8
+	blockKeySeparator     = "|"
 	maxCachedObjectDenom  = 4                // We will only cache objects less than 1/maxCachedObjectDenom of total cache size
 	bufferSize            = 15 * 1024 * 1024 // 15 MB
 )
@@ -50,6 +52,7 @@ type objBlockAPIServer struct {
 	objectCache     *groupcache.Group
 	tagCache        *groupcache.Group
 	objectInfoCache *groupcache.Group
+	blockCache      *groupcache.Group
 	// The total number of bytes cached for objects
 	objectCacheBytes int64
 	// The GC generation number.  Incrementing this number effectively
@@ -81,17 +84,20 @@ func newObjBlockAPIServer(dir string, cacheBytes int64, etcdAddress string, objC
 	objectGroupName := "object"
 	tagGroupName := "tag"
 	objectInfoGroupName := "objectInfo"
+	blockGroupName := "block"
 
 	if test {
 		uuid := uuid.New()
 		objectGroupName += uuid
 		tagGroupName += uuid
 		objectInfoGroupName += uuid
+		blockGroupName += uuid
 	}
 
 	s.objectCache = groupcache.NewGroup(objectGroupName, oneCacheShare*objectCacheShares, groupcache.GetterFunc(s.objectGetter))
 	s.tagCache = groupcache.NewGroup(tagGroupName, oneCacheShare*tagCacheShares, groupcache.GetterFunc(s.tagGetter))
 	s.objectInfoCache = groupcache.NewGroup(objectInfoGroupName, oneCacheShare*objectInfoCacheShares, groupcache.GetterFunc(s.objectInfoGetter))
+	s.blockCache = groupcache.NewGroup(blockGroupName, oneCacheShare*blockCacheShares, groupcache.GetterFunc(s.blockGetter))
 
 	if !test {
 		RegisterCacheStats("tag", &s.tagCache.Stats)
@@ -240,7 +246,7 @@ func (s *objBlockAPIServer) PutObjectSplit(server pfsclient.ObjectAPI_PutObjectS
 			return err
 		}
 	}
-	return server.SendAndClose(&pfsclient.Objects{objects})
+	return server.SendAndClose(&pfsclient.Objects{Objects: objects})
 }
 
 func (s *objBlockAPIServer) putObject(ctx context.Context, dataReader io.Reader, split bool) (_ *pfsclient.Object, retErr error) {
@@ -286,7 +292,7 @@ func (s *objBlockAPIServer) putObject(ctx context.Context, dataReader io.Reader,
 	}
 	object := &pfsclient.Object{Hash: pfsclient.EncodeHash(hash.Sum(nil))}
 	// Now that we have a hash of the object we can check if it already exists.
-	resp, err := s.CheckObject(ctx, &pfsclient.CheckObjectRequest{object})
+	resp, err := s.CheckObject(ctx, &pfsclient.CheckObjectRequest{Object: object})
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +314,41 @@ func (s *objBlockAPIServer) putObject(ctx context.Context, dataReader io.Reader,
 		}
 	}
 	return object, nil
+}
+
+func (s *objBlockAPIServer) PutObjects(server pfsclient.ObjectAPI_PutObjectsServer) (retErr error) {
+	func() { s.Log(nil, nil, nil, 0) }()
+	defer func(start time.Time) { s.Log(nil, nil, retErr, time.Since(start)) }(time.Now())
+	defer drainObjectServer(server)
+	request, err := server.Recv()
+	if err != nil {
+		return err
+	}
+	if request.Block == nil {
+		return fmt.Errorf("first put objects request should include a block")
+	}
+
+	blockPath := s.blockPath(request.Block)
+	putObjectReader := &putObjectReader{
+		server: server,
+	}
+	w, err := s.objClient.Writer(blockPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := w.Close(); err != nil && retErr == nil {
+			retErr = err
+		}
+	}()
+	buf := grpcutil.GetBuffer()
+	defer grpcutil.PutBuffer(buf)
+	_, err = io.CopyBuffer(w, putObjectReader, buf)
+	if err != nil {
+		s.objClient.Delete(blockPath)
+		return err
+	}
+	return nil
 }
 
 func (s *objBlockAPIServer) GetObject(request *pfsclient.Object, getObjectServer pfsclient.ObjectAPI_GetObjectServer) (retErr error) {
@@ -337,6 +378,11 @@ func (s *objBlockAPIServer) GetObject(request *pfsclient.Object, getObjectServer
 		if err != nil {
 			return err
 		}
+		defer func() {
+			if err := r.Close(); err != nil && retErr == nil {
+				retErr = err
+			}
+		}()
 		return grpcutil.WriteToStreamingBytesServer(r, getObjectServer)
 	}
 	var data []byte
@@ -387,6 +433,9 @@ func (s *objBlockAPIServer) GetObjects(request *pfsclient.GetObjectsRequest, get
 			if err := grpcutil.WriteToStreamingBytesServer(r, getObjectsServer); err != nil {
 				return err
 			}
+			if err := r.Close(); err != nil && retErr == nil {
+				retErr = err
+			}
 		} else {
 			var data []byte
 			sink := groupcache.AllocatingByteSliceSink(&data)
@@ -412,11 +461,64 @@ func (s *objBlockAPIServer) GetObjects(request *pfsclient.GetObjectsRequest, get
 	return nil
 }
 
+func (s *objBlockAPIServer) GetBlocks(request *pfsclient.GetBlocksRequest, getBlockServer pfsclient.ObjectAPI_GetBlocksServer) (retErr error) {
+	func() { s.Log(request, nil, nil, 0) }()
+	defer func(start time.Time) { s.Log(request, nil, retErr, time.Since(start)) }(time.Now())
+	offset := request.OffsetBytes
+	size := request.SizeBytes
+	for _, blockRef := range request.BlockRefs {
+		blockSize := blockRef.Range.Upper - blockRef.Range.Lower
+		if offset > blockSize {
+			offset -= blockSize
+			continue
+		}
+		readSize := blockSize - offset
+		if size < readSize && request.SizeBytes != 0 {
+			readSize = size
+		}
+		if request.TotalSize >= uint64(s.objectCacheBytes/maxCachedObjectDenom) {
+			blockPath := s.blockPath(blockRef.Block)
+			r, err := s.objClient.Reader(blockPath, blockRef.Range.Lower+offset, readSize)
+			if err != nil {
+				return err
+			}
+			if err := grpcutil.WriteToStreamingBytesServer(r, getBlockServer); err != nil {
+				return err
+			}
+			if err := r.Close(); err != nil && retErr == nil {
+				retErr = err
+			}
+			continue
+		}
+		var data []byte
+		key := blockRef.Block.Hash + "|" + strconv.FormatUint(blockRef.Range.Lower, 10) + "|" + strconv.FormatUint(blockRef.Range.Upper, 10)
+		sink := groupcache.AllocatingByteSliceSink(&data)
+		if err := s.blockCache.Get(getBlockServer.Context(), key, sink); err != nil {
+			return err
+		}
+		if uint64(len(data)) < offset+readSize {
+			return fmt.Errorf("undersized object (this is likely a bug)")
+		}
+		if err := grpcutil.WriteToStreamingBytesServer(bytes.NewReader(data[offset:offset+readSize]), getBlockServer); err != nil {
+			return err
+		}
+		// We've hit the offset so we set it to 0
+		offset = 0
+		if request.SizeBytes != 0 {
+			size -= readSize
+			if size == 0 {
+				break
+			}
+		}
+	}
+	return nil
+}
+
 func (s *objBlockAPIServer) TagObject(ctx context.Context, request *pfsclient.TagObjectRequest) (response *types.Empty, retErr error) {
 	func() { s.Log(request, nil, nil, 0) }()
 	defer func(start time.Time) { s.Log(request, response, retErr, time.Since(start)) }(time.Now())
 	// First inspect the object to make sure it actually exists
-	resp, err := s.CheckObject(ctx, &pfsclient.CheckObjectRequest{request.Object})
+	resp, err := s.CheckObject(ctx, &pfsclient.CheckObjectRequest{Object: request.Object})
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +564,7 @@ func (s *objBlockAPIServer) ListObjects(request *pfsclient.ListObjectsRequest, l
 	defer func(start time.Time) { s.Log(request, nil, retErr, time.Since(start)) }(time.Now())
 
 	return s.objClient.Walk(s.objectDir(), func(key string) error {
-		return listObjectsServer.Send(&pfsclient.Object{filepath.Base(key)})
+		return listObjectsServer.Send(client.NewObject(filepath.Base(key)))
 	})
 }
 
@@ -803,7 +905,19 @@ func (s *objBlockAPIServer) writeInternal(path string, data []byte) (retErr erro
 }
 
 func (s *objBlockAPIServer) blockGetter(ctx groupcache.Context, key string, dest groupcache.Sink) (retErr error) {
-	return s.readObj(s.blockPath(client.NewBlock(key)), 0, 0, dest)
+	fields := strings.Split(key, blockKeySeparator)
+	if len(fields) != 3 {
+		return fmt.Errorf("bad block key: %s", key)
+	}
+	lower, err := strconv.ParseUint(fields[1], 10, 64)
+	if err != nil {
+		return err
+	}
+	upper, err := strconv.ParseUint(fields[2], 10, 64)
+	if err != nil {
+		return err
+	}
+	return s.readObj(s.blockPath(client.NewBlock(fields[0])), lower, upper-lower, dest)
 }
 
 func (s *objBlockAPIServer) objectGetter(ctx groupcache.Context, key string, dest groupcache.Sink) error {
@@ -940,11 +1054,12 @@ func (s *objBlockAPIServer) readObj(path string, offset uint64, size uint64, des
 			retErr = err
 		}
 	}()
-	data, err := ioutil.ReadAll(reader)
+	buff := make([]byte, size)
+	_, err = io.ReadFull(reader, buff)
 	if err != nil {
 		return err
 	}
-	return dest.SetBytes(data)
+	return dest.SetBytes(buff)
 }
 
 func (s *objBlockAPIServer) readBlockRef(blockRef *pfsclient.BlockRef, dest groupcache.Sink) error {
@@ -1073,6 +1188,7 @@ func (r *putObjectReader) Read(p []byte) (int, error) {
 		if err != nil {
 			return 0, err
 		}
+		r.buffer.Reset()
 		// buffer.Write cannot error
 		r.buffer.Write(request.Value)
 		r.tags = append(r.tags, request.Tags...)

@@ -53,6 +53,7 @@ message Service {
   string ip = 3 [(gogoproto.customname) = "IP"];
 }
 
+// Note: this is deprecated and replaced by `PfsInput`
 message AtomInput {
   reserved 7;
   string name = 1;
@@ -65,6 +66,19 @@ message AtomInput {
   // empty files. This is useful in shuffle pipelines where you want to read
   // the names of files and reorganize them using symlinks.
   bool empty_files = 8;
+}
+
+message PFSInput {
+  string name = 1;
+  string repo = 2;
+  string branch = 3;
+  string commit = 4;
+  string glob = 5;
+  bool lazy = 6;
+  // EmptyFiles, if true, will cause files from this PFS input to be
+  // presented as empty files. This is useful in shuffle pipelines where you
+  // want to read the names of files and reorganize them using symlinks.
+  bool empty_files = 7;
 }
 
 message CronInput {
@@ -83,7 +97,9 @@ message GitInput {
 }
 
 message Input {
+  // Note: this is deprecated and replaced by `PfsInput`
   AtomInput atom = 1;
+  PFSInput pfs = 6;
   repeated Input cross = 2;
   repeated Input union = 3;
   CronInput cron = 4;
@@ -232,7 +248,7 @@ message EtcdJobInfo {
 }
 
 message JobInfo {
-  reserved 4, 5;
+  reserved 4, 5, 28;
   Job job = 1;
   Transform transform = 2;
   Pipeline pipeline = 3;
@@ -259,7 +275,6 @@ message JobInfo {
   ResourceSpec resource_limits = 36;
   Input input = 26;
   pfs.BranchInfo new_branch = 27;
-  bool incremental = 28;
   pfs.Commit stats_commit = 29;
   bool enable_stats = 32;
   string salt = 33;
@@ -333,13 +348,13 @@ message EtcdPipelineInfo {
 }
 
 message PipelineInfo {
-  reserved 3, 4, 26;
+  reserved 3, 4, 22, 26;
   string id = 17 [(gogoproto.customname) = "ID"];
   Pipeline pipeline = 1;
   uint64 version = 11;
   Transform transform = 2;
   ParallelismSpec parallelism_spec = 10;
-	HashtreeSpec hashtree_spec = 42;
+  HashtreeSpec hashtree_spec = 42;
   Egress egress = 15;
   google.protobuf.Timestamp created_at = 6;
 
@@ -361,7 +376,6 @@ message PipelineInfo {
   ResourceSpec resource_limits = 31;
   Input input = 20;
   string description = 21;
-  bool incremental = 22;
   string cache_size = 23;
   bool enable_stats = 24;
   string salt = 25;
@@ -521,7 +535,7 @@ message SchedulingSpec {
 }
 
 message CreatePipelineRequest {
-  reserved 3, 4;
+  reserved 3, 4, 15;
   Pipeline pipeline = 1;
   Transform transform = 2;
   ParallelismSpec parallelism_spec = 7;
@@ -534,7 +548,6 @@ message CreatePipelineRequest {
   ResourceSpec resource_limits = 22;
   Input input = 13;
   string description = 14;
-  bool incremental = 15;
   string cache_size = 16;
   bool enable_stats = 17;
   // Reprocess forces the pipeline to reprocess all datums.

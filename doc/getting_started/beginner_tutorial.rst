@@ -39,15 +39,15 @@ Let's start by just adding a file, in this case an image, to a new commit. We've
 
 We'll use the ``put-file`` command along with the ``-f`` flag. ``-f`` can take either a local file, a URL, or a object storage bucket which it'll automatically scrape. In our case, we'll simply pass the URL.
 
-Unlike Git though, commits in Pachyderm must be explicitly started and finished as they can contain huge amounts of data and we don't want that much "dirty" data hanging around in an unpersisted state. `Put-file` automatically starts and finishes a commit for you so you can add files more easily. In a situation where you want to add many files over a period of time, you can do `start-commit` and `finish-commit` yourself.
+Unlike Git, commits in Pachyderm must be explicitly started. Similar to Git though, commits must also be explicitly finished, as they can contain huge amounts of data and we don't want that much "dirty" data hanging around in an unpersisted state. Although commits are explicitly managed, `put-file` offers a shortcut: if you run `put-file` on a repo that does not have an open commit, it automatically opens and closes the commit for you. This is called an atomic commit. Alternatively, in a situation where you want to add many files over a period of time, or you want add a commit message, you can manually call `start-commit` and `finish-commit` yourself.
 
-We also specify the repo name "images", the branch name "master", and what we want to name the file, "liberty.png".
+Here's an example atomic commit of the file `liberty.png` to the `images` repo's `master` branch:
 
 .. code-block:: shell
 
 	$ pachctl put-file images master liberty.png -f http://imgur.com/46Q8nDz.png
 
-Finally, we check to make sure the data we just added is in Pachyderm.
+We can check to make sure the data we just added is in Pachyderm.
 
 .. code-block:: shell
 
@@ -66,7 +66,7 @@ Finally, we check to make sure the data we just added is in Pachyderm.
   NAME                TYPE                SIZE
   liberty.png         file                57.27 KiB
 
-We can view the file we just added to Pachyderm. Since this is an image, we can't just print it out in the terminal, but the following commands will let you view it easily.
+We can also view the file we just added to Pachyderm. Since this is an image, we can't just print it out in the terminal, but the following commands will let you view it easily.
 
 .. code-block:: shell
  
@@ -79,7 +79,7 @@ We can view the file we just added to Pachyderm. Since this is an image, we can'
 Create a Pipeline
 ^^^^^^^^^^^^^^^^^
 
-Now that we've got some data in our repo, it's time to do something with it. ``Pipelines`` are the core processing primitive in Pachyderm and they're specified with a JSON encoding. For this example, we've already created the pipeline for you and you can find the `code on Github <https://github.com/pachyderm/pachyderm/blob/master/doc/examples/opencv>`_. 
+Now that we've got some data in our repo, it's time to do something with it. ``Pipelines`` are the core processing primitive in Pachyderm and they're specified with a JSON encoding. For this example, we've already created the pipeline for you and you can find the `code on Github <https://github.com/pachyderm/pachyderm/blob/master/examples/opencv>`_. 
 
 When you want to create your own pipelines later, you can refer to the full :doc:`../reference/pipeline_spec` to use more advanced options. This includes building your own code into a container instead of the pre-built Docker image we'll be using here.
 
@@ -101,7 +101,7 @@ Below is the pipeline spec and python code we're using. Let's walk through the d
       "image": "pachyderm/opencv"
     },
     "input": {
-      "atom": {
+      "pfs": {
         "repo": "images",
         "glob": "/*"
       }
@@ -109,7 +109,7 @@ Below is the pipeline spec and python code we're using. Let's walk through the d
   }
 
 
-Our pipeline spec contains a few simple sections. First is the pipeline ``name``, edges. Then we have the ``transform`` which specifies the docker image we want to use, ``pachyderm/opencv`` (defaults to DockerHub as the registry), and the entry point ``edges.py``. Lastly, we specify the input.  Here we only have one "atom" input, our images repo with a particular glob pattern. 
+Our pipeline spec contains a few simple sections. First is the pipeline ``name``, edges. Then we have the ``transform`` which specifies the docker image we want to use, ``pachyderm/opencv`` (defaults to DockerHub as the registry), and the entry point ``edges.py``. Lastly, we specify the input.  Here we only have one PFS input, our images repo with a particular glob pattern. 
 
 The glob pattern defines how the input data can be broken up if we wanted to distribute our computation. ``/*`` means that each file can be processed individually, which makes sense for images. Glob patterns are one of the most powerful features of Pachyderm so when you start creating your own pipelines, check out the :doc:`../reference/pipeline_spec`.
 
@@ -143,7 +143,7 @@ Now let's create the pipeline in Pachyderm:
 
 .. code-block:: shell
 
-  $ pachctl create-pipeline -f https://raw.githubusercontent.com/pachyderm/pachyderm/master/doc/examples/opencv/edges.json
+  $ pachctl create-pipeline -f https://raw.githubusercontent.com/pachyderm/pachyderm/master/examples/opencv/edges.json
 
 
 
@@ -245,13 +245,13 @@ Below is the pipeline spec for this new pipeline:
     },
     "input": {
       "cross": [ {
-        "atom": {
+        "pfs": {
           "glob": "/",
           "repo": "images"
         }
       },
       {
-        "atom": {
+        "pfs": {
           "glob": "/",
           "repo": "edges"
         }
@@ -272,7 +272,7 @@ We create this next pipeline as before, with ``pachctl``:
 
 .. code-block:: shell
 
-  $ pachctl create-pipeline -f https://raw.githubusercontent.com/pachyderm/pachyderm/master/doc/examples/opencv/montage.json
+  $ pachctl create-pipeline -f https://raw.githubusercontent.com/pachyderm/pachyderm/master/examples/opencv/montage.json
 
 This will automatically trigger a job that generates a montage for all the current HEAD commits of the input repos:
 
